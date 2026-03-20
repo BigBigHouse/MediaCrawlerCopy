@@ -58,6 +58,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self.timeout = timeout
         self.headers = headers
         self._host = "https://edith.xiaohongshu.com"
+        self._creator_host = "https://creator.xiaohongshu.com"
         self._domain = "https://www.xiaohongshu.com"
         self.IP_ERROR_STR = "Network connection error, please check network settings or restart"
         self.IP_ERROR_CODE = 300012
@@ -141,7 +142,15 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
 
         if return_response:
             return response.text
-        data: Dict = response.json()
+        try:
+            data: Dict = response.json()
+        except ValueError as exc:
+            # Some risk-control or upstream proxy pages are not JSON; expose key context for debugging.
+            snippet = response.text[:300].replace("\n", " ")
+            raise DataFetchError(
+                f"Non-JSON response: status={response.status_code}, "
+                f"content_type={response.headers.get('content-type', '')}, body={snippet}"
+            ) from exc
         if data["success"]:
             return data.get("data", data.get("success", {}))
         elif data["code"] == self.IP_ERROR_CODE:
@@ -385,6 +394,143 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             "xsec_token": xsec_token,
         }
         return await self.get(uri, params)
+
+    async def post_comment(
+        self,
+        note_id: str,
+        content: str,
+        target_comment_id: str = "",
+        at_users: Optional[List[Dict[str, Any]]] = None,
+        xsec_token: str = "",
+        xsec_source: str = "",
+    ) -> Dict:
+        """Post a new comment or reply to an existing comment.
+
+        Args:
+            note_id: Note ID
+            content: Comment content
+            target_comment_id: Target comment ID when replying; empty for top-level comment
+            at_users: Mentioned users list, usually []
+            xsec_token: Optional xsec_token for stricter risk control scenes
+            xsec_source: Optional xsec_source for stricter risk control scenes
+        """
+        uri = "/api/sns/web/v1/comment/post"
+        data: Dict[str, Any] = {
+            "note_id": note_id,
+            "content": content,
+            "target_comment_id": target_comment_id,
+            "at_users": at_users or [],
+        }
+        # Some accounts/scenes may require xsec parameters for write operations.
+        if xsec_token:
+            data["xsec_token"] = xsec_token
+        if xsec_source:
+            data["xsec_source"] = xsec_source
+        return await self.post(uri, data)
+
+    # ------------------------------------------------------------------ #
+    #  Note publish APIs                                                   #
+    # ------------------------------------------------------------------ #
+
+    async def apply_upload_token(self, scene: str = "image", filetype: str = "jpg") -> Dict:
+        """申请媒体文件上传凭证。
+
+        Args:
+            scene: 上传场景：图片传 "image"，视频传 "video"，视频封面传 "preview_video"
+            filetype: 文件后缀，如 "jpg" / "png" / "mp4"（暂未使用，保留兼容性）
+
+        Returns:
+            {"upload_url": str, "token": str, "file_id": str}
+            upload_url 已拼接为 https://{uploadAddr}/{fileId} 格式
+        """
+        uri = "/api/media/v1/upload/creator/permit"
+        params = {
+            "biz_name": "spectrum",
+            "scene": scene,
+            "file_count": "1",
+            "version": "1",
+            "source": "web",
+        }
+        headers = await self._pre_headers(uri, params)
+        full_url = f"{self._creator_host}{uri}"
+        resp_data = await self.request("GET", full_url, headers=headers, params=params)
+        # resp_data 是 data 字段: {"result": ..., "uploadTempPermits": [...]}
+        permit = (resp_data.get("uploadTempPermits") or [{}])[0]
+        file_id: str = (permit.get("fileIds") or [""])[0]
+        upload_addr: str = permit.get("uploadAddr", "")
+        token: str = permit.get("token", "")
+        upload_url = f"https://{upload_addr}/{file_id}"
+        return {"upload_url": upload_url, "token": token, "file_id": file_id}
+
+    async def upload_file_to_oss(
+        self,
+        upload_url: str,
+        token: str,
+        file_content: bytes,
+        filetype: str = "jpg",
+    ) -> bool:
+        """向 OSS 直传媒体文件（PUT raw bytes + Authorization: UpToken）。
+
+        Args:
+            upload_url: apply_upload_token 返回的完整上传地址（https://{uploadAddr}/{fileId}）
+            token: apply_upload_token 返回的 token
+            file_content: 文件二进制内容
+            filetype: 文件后缀
+
+        Returns:
+            上传成功返回 True
+        """
+        await self._refresh_proxy_if_expired()
+        _mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png",  "webp": "image/webp",
+            "mp4": "video/mp4",  "mov": "video/quicktime",
+        }
+        content_type = _mime_map.get(filetype.lower(), "application/octet-stream")
+        headers = {
+            "x-cos-security-token": token,
+            "Content-Type": content_type,
+        }
+        async with make_async_client(proxy=self.proxy) as client:
+            response = await client.put(
+                upload_url,
+                content=file_content,
+                headers=headers,
+                timeout=self.timeout,
+            )
+            if response.status_code in (200, 201, 204):
+                return True
+
+        utils.logger.error(
+            f"[XiaoHongShuClient.upload_file_to_oss] Upload failed, "
+            f"url={upload_url[:160]}, status={response.status_code}, body={response.text[:120]}"
+        )
+        return False
+
+    async def query_video_status(self, file_ids: List[str]) -> Dict:
+        """查询视频转码状态。
+
+        Args:
+            file_ids: 视频 file_id 列表
+
+        Returns:
+            {"file_status_list": [{"file_id": str, "status": "transcoding"|"done"|"failed"}]}
+        """
+        uri = "/api/media/v1/query/video/status"
+        data = {"file_ids": file_ids}
+        return await self.post(uri, data)
+
+    async def publish_note(self, payload: Dict) -> Dict:
+        """发布笔记。
+
+        Args:
+            payload: 由 XiaoHongShuPublisher 构建的完整请求体
+
+        Returns:
+            {"note_id": str, ...}
+        """
+        uri = "/web_api/sns/v2/note"
+        return await self.post(uri, payload)
 
     async def get_note_all_comments(
         self,

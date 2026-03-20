@@ -46,6 +46,7 @@ from .exception import DataFetchError, NoteNotFoundError
 from .field import SearchSortType
 from .help import parse_note_info_from_note_url, parse_creator_info_from_url, get_search_id
 from .login import XiaoHongShuLogin
+from .publisher import XiaoHongShuPublisher
 
 
 class XiaoHongShuCrawler(AbstractCrawler):
@@ -117,6 +118,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
             elif config.CRAWLER_TYPE == "creator":
                 # Get creator's information and their notes and comments
                 await self.get_creators_and_notes()
+            elif config.CRAWLER_TYPE == "reply":
+                # Auto-reply to comments on specified notes or search results
+                await self.reply_comments()
+            elif config.CRAWLER_TYPE == "publish":
+                # Publish new notes (image or video)
+                await self.publish_notes()
             else:
                 pass
 
@@ -441,6 +448,226 @@ class XiaoHongShuCrawler(AbstractCrawler):
             # Fall back to standard mode
             chromium = playwright.chromium
             return await self.launch_browser(chromium, playwright_proxy, user_agent, headless)
+
+    async def reply_comments(self) -> None:
+        """评论回复主入口（CRAWLER_TYPE="reply"）。
+
+        优先级：
+          1. config.XHS_REPLY_NOTE_URL_LIST 非空 → 直接对指定笔记评论进行回复
+          2. 否则按 config.KEYWORDS 搜索笔记，再对结果笔记评论进行回复
+        """
+        if not config.ENABLE_REPLY_COMMENTS:
+            utils.logger.info(
+                "[XiaoHongShuCrawler.reply_comments] ENABLE_REPLY_COMMENTS is False, skip."
+            )
+            return
+
+        reply_note_urls: List[str] = getattr(config, "XHS_REPLY_NOTE_URL_LIST", [])
+        if reply_note_urls:
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.reply_comments] Reply mode: specified notes ({len(reply_note_urls)} URLs)"
+            )
+            note_ids, xsec_tokens = [], []
+            for url in reply_note_urls:
+                info = parse_note_info_from_note_url(url)
+                note_ids.append(info.note_id)
+                xsec_tokens.append(info.xsec_token)
+            await self.batch_reply_note_comments(note_ids, xsec_tokens)
+        else:
+            utils.logger.info(
+                "[XiaoHongShuCrawler.reply_comments] Reply mode: keyword search"
+            )
+            xhs_limit_count = 20
+            for keyword in config.KEYWORDS.split(","):
+                source_keyword_var.set(keyword.strip())
+                notes_res = await self.xhs_client.get_note_by_keyword(
+                    keyword=keyword.strip(),
+                    page=1,
+                    page_size=xhs_limit_count,
+                    sort=(
+                        SearchSortType(config.SORT_TYPE)
+                        if config.SORT_TYPE
+                        else SearchSortType.GENERAL
+                    ),
+                )
+                items = [
+                    item
+                    for item in notes_res.get("items", [])
+                    if item.get("model_type") not in ("rec_query", "hot_query")
+                    and item.get("id")
+                ]
+                note_ids = [item["id"] for item in items]
+                xsec_tokens = [item.get("xsec_token", "") for item in items]
+                await self.batch_reply_note_comments(note_ids, xsec_tokens)
+                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+
+    async def batch_reply_note_comments(
+        self, note_ids: List[str], xsec_tokens: List[str]
+    ) -> None:
+        """对一批笔记的评论批量回复，整体不超过 REPLY_MAX_COUNT_PER_RUN 条。"""
+        max_count: int = getattr(config, "REPLY_MAX_COUNT_PER_RUN", 10)
+        replied_total = 0
+        for note_id, xsec_token in zip(note_ids, xsec_tokens):
+            if replied_total >= max_count:
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler.batch_reply_note_comments] "
+                    f"Reached REPLY_MAX_COUNT_PER_RUN={max_count}, stop."
+                )
+                break
+            replied_total += await self.reply_one_note_comments(
+                note_id=note_id,
+                xsec_token=xsec_token,
+                remaining_quota=max_count - replied_total,
+            )
+            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+
+    async def reply_one_note_comments(
+        self,
+        note_id: str,
+        xsec_token: str,
+        remaining_quota: int = 10,
+    ) -> int:
+        """对单条笔记的评论进行回复，返回本次实际回复数量。
+
+        过滤规则：
+          - REPLY_TRIGGER_KEYWORDS 非空时，只回复包含其中任一关键词的评论
+          - 每条评论只回复一次（通过 comment_id 去重）
+        """
+        trigger_keywords: List[str] = getattr(config, "REPLY_TRIGGER_KEYWORDS", [])
+        reply_template: str = getattr(config, "REPLY_CONTENT_TEMPLATE", "感谢你的评论！")
+
+        comments_res = await self.xhs_client.get_note_comments(
+            note_id=note_id, xsec_token=xsec_token
+        )
+        comments: List[Dict] = comments_res.get("comments", [])
+        if not comments:
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.reply_one_note_comments] note_id={note_id} has no comments."
+            )
+            return 0
+
+        replied_count = 0
+        for comment in comments:
+            if replied_count >= remaining_quota:
+                break
+
+            comment_id: str = comment.get("id", "")
+            comment_content: str = comment.get("content", "")
+            author_nickname: str = (
+                comment.get("user_info", {}).get("nickname", "") or ""
+            )
+
+            # 关键词过滤
+            if trigger_keywords and not any(
+                kw in comment_content for kw in trigger_keywords
+            ):
+                continue
+
+            reply_content = reply_template.format(author=author_nickname)
+            try:
+                result = await self.xhs_client.post_comment(
+                    note_id=note_id,
+                    content=reply_content,
+                    target_comment_id=comment_id,
+                    xsec_token=xsec_token,
+                    xsec_source="pc_search",
+                )
+                replied_count += 1
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler.reply_one_note_comments] "
+                    f"Replied to comment {comment_id} on note {note_id}. "
+                    f"New comment id: {result.get('comment', {}).get('id', '')}"
+                )
+            except Exception as exc:
+                utils.logger.error(
+                    f"[XiaoHongShuCrawler.reply_one_note_comments] "
+                    f"Failed to reply comment {comment_id}: {exc}"
+                )
+            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+
+        return replied_count
+
+    async def publish_notes(self) -> None:
+        """笔记发布入口（CRAWLER_TYPE="publish"）。
+
+        读取 config.XHS_PUBLISH_NOTE_LIST 中的每条待发布任务并依次执行。
+        每条任务格式::
+
+            {
+                "type":   "image",                # "image" | "video"
+                "title":  "标题",
+                "desc":   "正文",
+                "images": ["path/1.jpg"],         # 图文必填
+                "video":  "path/video.mp4",       # 视频必填
+                "cover":  "path/cover.jpg",       # 视频可选
+                "topics": ["Python", "编程"],      # 可选
+            }
+        """
+        if not config.ENABLE_PUBLISH_NOTE:
+            utils.logger.info(
+                "[XiaoHongShuCrawler.publish_notes] ENABLE_PUBLISH_NOTE is False, skip."
+            )
+            return
+
+        note_tasks: List[Dict] = getattr(config, "XHS_PUBLISH_NOTE_LIST", [])
+        if not note_tasks:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler.publish_notes] XHS_PUBLISH_NOTE_LIST is empty."
+            )
+            return
+
+        publisher = XiaoHongShuPublisher(self.xhs_client)
+        for idx, task in enumerate(note_tasks):
+            note_type = task.get("type", "image").lower()
+            title     = task.get("title", "")
+            desc      = task.get("desc", "")
+            topics    = task.get("topics", [])
+
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.publish_notes] "
+                f"[{idx+1}/{len(note_tasks)}] Publishing {note_type} note: {title!r}"
+            )
+
+            if note_type == "image":
+                images = task.get("images", [])
+                if not images:
+                    utils.logger.error(
+                        f"[XiaoHongShuCrawler.publish_notes] Task #{idx+1} missing 'images', skip."
+                    )
+                    continue
+                result = await publisher.publish_image_note(
+                    title=title, desc=desc, image_paths=images, topics=topics
+                )
+            elif note_type == "video":
+                video = task.get("video", "")
+                if not video:
+                    utils.logger.error(
+                        f"[XiaoHongShuCrawler.publish_notes] Task #{idx+1} missing 'video', skip."
+                    )
+                    continue
+                result = await publisher.publish_video_note(
+                    title=title,
+                    desc=desc,
+                    video_path=video,
+                    cover_path=task.get("cover"),
+                    topics=topics,
+                )
+            else:
+                utils.logger.error(
+                    f"[XiaoHongShuCrawler.publish_notes] Unknown type={note_type!r}, skip."
+                )
+                continue
+
+            if result.success:
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler.publish_notes] ✅ Published note_id={result.note_id}"
+                )
+            else:
+                utils.logger.error(
+                    f"[XiaoHongShuCrawler.publish_notes] ❌ Failed: {result.error}"
+                )
+
+            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
 
     async def close(self):
         """Close browser context"""

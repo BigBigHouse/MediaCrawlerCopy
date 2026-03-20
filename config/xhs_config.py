@@ -35,3 +35,43 @@ XHS_CREATOR_ID_LIST = [
     "https://www.xiaohongshu.com/user/profile/5f58bd990000000001003753?xsec_token=ABYVg1evluJZZzpMX-VWzchxQ1qSNVW3r-jOEnKqMcgZw=&xsec_source=pc_search"
     # ........................
 ]
+
+# ==================== Comment Reply (CRAWLER_TYPE="reply") ====================
+# Specify note URLs whose comments will be replied to.
+# When non-empty, the reply mode targets these notes directly (ignores KEYWORDS search).
+# Each URL must carry xsec_token, same format as XHS_SPECIFIED_NOTE_URL_LIST.
+XHS_REPLY_NOTE_URL_LIST: list = [
+    # "https://www.xiaohongshu.com/explore/xxxx?xsec_token=xxx&xsec_source=pc_search"
+]
+
+# ==================== Note Publish (CRAWLER_TYPE="publish") ====================
+# List of notes to publish. Each item is a dict with the following keys:
+#
+#   type    (str, required) : "image" | "video"
+#   title   (str, required) : note title (max 20 chars recommended)
+#   desc    (str, required) : note body text
+#   images  (list, image)   : local image file paths, e.g. ["./imgs/1.jpg"]
+#   video   (str, video)    : local video file path, e.g. "./videos/clip.mp4"
+#   cover   (str, optional) : local cover image path for video notes
+#   topics  (list, optional): hashtag list, e.g. ["Python", "编程"]
+#
+# Example:
+#   XHS_PUBLISH_NOTE_LIST = [
+#       {
+#           "type": "image",
+#           "title": "今日分享",
+#           "desc": "这是一段图文内容",
+#           "images": ["./imgs/photo1.jpg", "./imgs/photo2.jpg"],
+#           "topics": ["日常", "分享"],
+#       },
+#       {
+#           "type": "video",
+#           "title": "我的视频",
+#           "desc": "视频简介",
+#           "video": "./videos/my_video.mp4",
+#           "cover": "./imgs/cover.jpg",
+#           "topics": ["视频"],
+#       },
+#   ]
+XHS_PUBLISH_NOTE_LIST: list = []
+

@@ -101,6 +101,25 @@ CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 10
 # If the old version of the project uses db, you need to refer to schema/tables.sql line 287 to add table fields.
 ENABLE_GET_SUB_COMMENTS = False
 
+# ==================== Comment Reply Configuration ====================
+# Whether to enable automatic comment reply mode (CRAWLER_TYPE="reply" must also be set)
+ENABLE_REPLY_COMMENTS = False
+
+# Reply content template.  Supported placeholders:
+#   {author}  - nickname of the comment author being replied to
+REPLY_CONTENT_TEMPLATE = "感谢你的评论！"
+
+# Only reply to comments whose content contains at least one of these keywords.
+# Empty list means reply to ALL comments.
+REPLY_TRIGGER_KEYWORDS: list = []
+
+# Maximum number of replies per single run (to avoid risk-control triggering)
+REPLY_MAX_COUNT_PER_RUN = 10
+
+# ==================== Note Publish Configuration ====================
+# Whether to enable note publishing mode (CRAWLER_TYPE="publish" must also be set)
+ENABLE_PUBLISH_NOTE = False
+
 # word cloud related
 # Whether to enable generating comment word clouds
 ENABLE_GET_WORDCLOUD = False
