@@ -518,7 +518,14 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         uri = "/api/media/v1/query/video/status"
         data = {"file_ids": file_ids}
-        return await self.post(uri, data)
+        headers = await self._pre_headers(uri, payload=data)
+        json_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        return await self.request(
+            method="POST",
+            url=f"{self._creator_host}{uri}",
+            data=json_str,
+            headers=headers,
+        )
 
     async def publish_note(self, payload: Dict) -> Dict:
         """发布笔记。

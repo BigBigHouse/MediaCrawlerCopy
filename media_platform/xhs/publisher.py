@@ -24,6 +24,7 @@
 """
 
 import asyncio
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -108,7 +109,14 @@ class XiaoHongShuPublisher:
                     f"[XiaoHongShuPublisher] Uploaded image: {path} → file_id={file_id}"
                 )
 
-            # 2. 构建 payload 并发布
+            # 2. 上传完成后随机等待 10~20s，模拟人工操作间隔
+            delay = random.uniform(10, 20)
+            utils.logger.info(
+                f"[XiaoHongShuPublisher] Waiting {delay:.1f}s before publishing..."
+            )
+            await asyncio.sleep(delay)
+
+            # 3. 构建 payload 并发布
             payload = self._build_image_payload(title, desc, image_info_list, topics or [])
             raw = await self._client.publish_note(payload)
             note_id = raw.get("note_id", "") or raw.get("id", "")
@@ -176,6 +184,12 @@ class XiaoHongShuPublisher:
             payload = self._build_video_payload(
                 title, desc, video_file_id, cover_file_id, duration, topics or []
             )
+            # 所有媒体准备完成后随机等待 10~20s，模拟人工操作间隔
+            delay = random.uniform(10, 20)
+            utils.logger.info(
+                f"[XiaoHongShuPublisher] Waiting {delay:.1f}s before publishing..."
+            )
+            await asyncio.sleep(delay)
             raw = await self._client.publish_note(payload)
             note_id = raw.get("note_id", "") or raw.get("id", "")
             utils.logger.info(
@@ -252,11 +266,21 @@ class XiaoHongShuPublisher:
         return file_id, width, height
 
     async def _wait_video_ready(self, file_id: str, max_wait_sec: int = 300) -> bool:
-        """轮询视频转码状态，每 5 秒查询一次直到 done 或超时。"""
+        """轮询视频转码状态，每 5 秒查询一次直到 done 或超时。
+
+        若状态接口持续不可用（404 / 非预期响应），等待 min_wait_sec 秒后
+        假定转码已完成并返回 True，避免无谓超时。
+        """
+        _MIN_WAIT_SEC = 30    # 接口不可用时至少等待 30 秒
+        total_waited = 0
+        consecutive_errors = 0
+
         for _ in range(max_wait_sec // 5):
             await asyncio.sleep(5)
+            total_waited += 5
             try:
                 res = await self._client.query_video_status([file_id])
+                consecutive_errors = 0
                 status_list = res.get("file_status_list", [])
                 if not status_list:
                     continue
@@ -272,9 +296,19 @@ class XiaoHongShuPublisher:
                     )
                     return False
             except Exception as exc:
+                consecutive_errors += 1
+                detail = self._unwrap_error(exc)
                 utils.logger.warning(
-                    f"[XiaoHongShuPublisher._wait_video_ready] query error: {exc}"
+                    f"[XiaoHongShuPublisher._wait_video_ready] query error "
+                    f"(#{consecutive_errors}): {detail}"
                 )
+                # 接口持续不可用：等足最短时间后假定转码完成
+                if consecutive_errors >= 3 and total_waited >= _MIN_WAIT_SEC:
+                    utils.logger.info(
+                        f"[XiaoHongShuPublisher] Status API unavailable, "
+                        f"assuming video ready after {total_waited}s"
+                    )
+                    return True
         return False
 
     @staticmethod
