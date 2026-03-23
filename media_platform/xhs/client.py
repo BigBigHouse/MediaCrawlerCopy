@@ -151,14 +151,15 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 f"Non-JSON response: status={response.status_code}, "
                 f"content_type={response.headers.get('content-type', '')}, body={snippet}"
             ) from exc
-        if data["success"]:
+        if data.get("success"):
             return data.get("data", data.get("success", {}))
-        elif data["code"] == self.IP_ERROR_CODE:
+        code = data.get("code")
+        if code == self.IP_ERROR_CODE:
             raise IPBlockError(self.IP_ERROR_STR)
-        elif data["code"] in (self.NOTE_NOT_FOUND_CODE, self.NOTE_ABNORMAL_CODE):
-            raise NoteNotFoundError(f"Note not found or abnormal, code: {data['code']}")
+        elif code in (self.NOTE_NOT_FOUND_CODE, self.NOTE_ABNORMAL_CODE):
+            raise NoteNotFoundError(f"Note not found or abnormal, code: {code}")
         else:
-            err_msg = data.get("msg", None) or f"{response.text}"
+            err_msg = data.get("msg") or f"code={code} body={response.text[:300]}"
             raise DataFetchError(err_msg)
 
     async def get(self, uri: str, params: Optional[Dict] = None) -> Dict:

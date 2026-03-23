@@ -58,7 +58,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     def __init__(self) -> None:
         self.index_url = "https://www.xiaohongshu.com"
         # self.user_agent = utils.get_user_agent()
-        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
 
@@ -377,11 +377,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 "referer": "https://www.xiaohongshu.com/",
                 "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
                 "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
+                "sec-ch-ua-platform": '"macOS"',
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-site",
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                "user-agent": self.user_agent,
                 "Cookie": cookie_str,
             },
             playwright_page=self.context_page,
