@@ -369,6 +369,245 @@ class WeiboClient(ProxyRefreshMixin):
         }
         return await self.get(uri, params)
 
+    def _get_st_token(self) -> str:
+        """从 Cookie 中提取 CSRF Token（st）"""
+        return self.cookie_dict.get("XSRF-TOKEN", "")
+
+    @staticmethod
+    def _parse_upload_pic_id(text: str) -> str:
+        """解析 picupload.weibo.com 的混合 HTML+JSON 响应，提取 pic_id。
+
+        响应格式：
+            <meta ...><script ...></script>
+            {"code":"A00006","data":{"count":1,"data":"<base64>","..."}}
+
+        base64 解码后：
+            {"uid":..., "pics":{"pic_1":{"pid":"007UiXXX..."}}}
+        """
+        import base64
+        import json as _json
+
+        # 1. 从混合响应里提取 JSON 部分（找第一个 { 到结尾）
+        json_start = text.find("{")
+        if json_start == -1:
+            return ""
+        try:
+            outer = _json.loads(text[json_start:])
+        except Exception:
+            return ""
+
+        # 2. 检查 code（A00006 = 成功）
+        code = outer.get("code", "")
+        if code and not code.startswith("A00006"):
+            utils.logger.warning(f"[WeiboClient] 图片上传返回非成功 code={code}")
+
+        # 3. 解码 data.data（base64）
+        raw_data = outer.get("data", {})
+        b64_str: str = raw_data.get("data", "")
+        if b64_str:
+            try:
+                inner_json = base64.b64decode(b64_str + "==").decode("utf-8", errors="ignore")
+                inner = _json.loads(inner_json)
+                pics: dict = inner.get("pics", {})
+                # 取第一张图的 pid
+                for pic_info in pics.values():
+                    if isinstance(pic_info, dict) and pic_info.get("pid"):
+                        return pic_info["pid"]
+            except Exception as e:
+                utils.logger.warning(f"[WeiboClient] base64 decode failed: {e}")
+
+        # 4. 直接从 data 层取 pic_id
+        for key in ("pic_id", "picid", "pid"):
+            v = raw_data.get(key, "")
+            if v:
+                return str(v)
+
+        # 5. XML 兜底
+        for tag in ("pic_id", "picid", "pid"):
+            m = re.search(rf"<{tag}>([^<]+)</{tag}>", text, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+        return ""
+
+    async def upload_pic(self, image_path: str) -> str:
+        """上传图片到微博，返回 pic_id。
+
+        使用 m.weibo.cn 同域接口，pic_id 与当前 session 绑定，可直接用于发布。
+
+        Args:
+            image_path: 本地图片路径
+
+        Returns:
+            pic_id 字符串，发布微博时用 picId 字段传入
+        """
+        import mimetypes
+        from pathlib import Path
+
+        path = Path(image_path)
+        if not path.exists():
+            raise FileNotFoundError(f"图片文件不存在：{image_path}")
+
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            mime_type = "image/jpeg"
+
+        with open(image_path, "rb") as fh:
+            content = fh.read()
+
+        st = self._get_st_token()
+        # picupload.weibo.com 是 weibo.com 子域，m.weibo.cn 的 cookie 完全适用
+        upload_url = "https://picupload.weibo.com/interface/pic_upload.php"
+        headers = {
+            **self.headers,
+            "X-XSRF-TOKEN": st,
+            "Origin": "https://m.weibo.cn",
+            "Referer": "https://m.weibo.cn/",
+        }
+        headers.pop("Content-Type", None)
+
+        async with make_async_client(proxy=self.proxy) as client:
+            response = await client.request(
+                "POST",
+                upload_url,
+                headers=headers,
+                files={"pic1": (path.name, content, mime_type)},
+                data={"st": st, "s": "json"},   # 请求 JSON 格式响应
+                timeout=self.timeout,
+            )
+
+        utils.logger.info(
+            f"[WeiboClient.upload_pic] status={response.status_code} "
+            f"response={response.text[:500]}"
+        )
+
+        if response.status_code != 200:
+            raise DataFetchError(f"图片上传失败，status={response.status_code}, body={response.text[:200]}")
+
+        text = response.text.strip()
+        pic_id = self._parse_upload_pic_id(text)
+        utils.logger.info(f"[WeiboClient.upload_pic] 提取到 pic_id={pic_id!r}")
+
+        if not pic_id:
+            raise DataFetchError(f"图片上传响应中未找到 pic_id，响应：{text[:400]}")
+
+        utils.logger.info(f"[WeiboClient.upload_pic] 图片上传成功，pic_id={pic_id}")
+        return pic_id
+
+    async def publish_weibo(
+        self,
+        content: str,
+        pic_ids: Optional[List[str]] = None,
+    ) -> Dict:
+        """发布微博。
+
+        Args:
+            content:  微博正文（纯文本，话题用 #话题名# 格式）
+            pic_ids:  已上传图片的 pic_id 列表（最多 9 张）
+
+        Returns:
+            微博数据字典，包含 id、idstr 等字段
+        """
+        st = self._get_st_token()
+        uri = "/api/statuses/update"
+        payload: Dict = {
+            "content": content,
+            "st": st,
+            "visible": 0,
+        }
+        if pic_ids:
+            payload["picId"] = ",".join(pic_ids)
+
+        headers = {
+            **self.headers,
+            "X-XSRF-TOKEN": st,
+            "Content-Type": "application/json;charset=UTF-8",
+            "Referer": "https://m.weibo.cn/compose/",
+        }
+        import json as _json
+        async with make_async_client(proxy=self.proxy) as client:
+            response = await client.request(
+                "POST",
+                f"{self._host}{uri}",
+                headers=headers,
+                content=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                timeout=self.timeout,
+            )
+
+        try:
+            data = response.json()
+        except Exception:
+            raise DataFetchError(f"发布微博响应解析失败：{response.text[:200]}")
+
+        utils.logger.info(f"[WeiboClient.publish_weibo] response={data}")
+
+        ok_code = data.get("ok")
+        if ok_code != 1:
+            raise DataFetchError(f"发布微博失败：{data.get('msg', data)}")
+
+        weibo_data: Dict = data.get("data", {})
+        weibo_id = weibo_data.get("id") or weibo_data.get("idstr", "")
+        utils.logger.info(f"[WeiboClient.publish_weibo] 发布成功，weibo_id={weibo_id}")
+        return weibo_data
+
+    async def post_comment(
+        self,
+        weibo_id: str,
+        content: str,
+        comment_id: str = "",
+    ) -> Dict:
+        """回复微博评论。
+
+        Args:
+            weibo_id:   微博 ID
+            content:    回复内容
+            comment_id: 要回复的评论 ID（为空则评论微博本身）
+
+        Returns:
+            评论数据字典
+        """
+        st = self._get_st_token()
+        uri = "/api/comments/create"
+        form_data: Dict[str, str] = {
+            "content": content,
+            "mid": weibo_id,
+            "st": st,
+            "_spr": "screen:1470x956",
+        }
+        if comment_id:
+            form_data["comment_ori"] = comment_id
+
+        headers = {
+            **self.headers,
+            "X-XSRF-TOKEN": st,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"https://m.weibo.cn/detail/{weibo_id}",
+        }
+        async with make_async_client(proxy=self.proxy) as client:
+            response = await client.request(
+                "POST",
+                f"{self._host}{uri}",
+                headers=headers,
+                data=form_data,
+                timeout=self.timeout,
+            )
+
+        try:
+            data = response.json()
+        except Exception:
+            raise DataFetchError(f"回复评论响应解析失败：{response.text[:200]}")
+
+        utils.logger.info(f"[WeiboClient.post_comment] response={data}")
+
+        ok_code = data.get("ok")
+        if ok_code != 1:
+            raise DataFetchError(f"回复评论失败：{data.get('msg', data)}")
+
+        comment_data: Dict = data.get("data", {})
+        comment_result_id = comment_data.get("id") or comment_data.get("idstr", "")
+        utils.logger.info(f"[WeiboClient.post_comment] 回复成功，comment_id={comment_result_id}")
+        return comment_data
+
     async def get_all_notes_by_creator_id(
         self,
         creator_id: str,
