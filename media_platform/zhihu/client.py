@@ -61,6 +61,7 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         self.default_headers = headers
         self.cookie_dict = cookie_dict
         self._extractor = ZhihuExtractor()
+        self.playwright_page = playwright_page
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
 
@@ -139,6 +140,68 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         headers = await self._pre_headers(final_uri)
         base_url = (zhihu_constant.ZHIHU_URL if "/p/" not in uri else zhihu_constant.ZHIHU_ZHUANLAN_URL)
         return await self.request(method="GET", url=base_url + final_uri, headers=headers, **kwargs)
+
+    def _build_write_headers(self, uri: str) -> Dict:
+        """为写操作（POST/PUT/PATCH）构建请求头：签名 + cookies + xsrf + Content-Type"""
+        sign_res = sign(uri, self.default_headers["cookie"])
+        headers = self.default_headers.copy()
+        headers["Content-Type"] = "application/json"
+        headers["x-zst-81"] = sign_res["x-zst-81"]
+        headers["x-zse-96"] = sign_res["x-zse-96"]
+        xsrf = self._get_xsrf_token()
+        if xsrf:
+            headers["x-xsrftoken"] = xsrf
+        return headers
+
+    def _is_zhuanlan_uri(self, uri: str) -> bool:
+        """判断是否为专栏 API"""
+        return "/api/articles" in uri
+
+    async def post(self, uri: str, json_data: Optional[Dict] = None, **kwargs) -> Union[str, Any]:
+        """
+        POST 请求，带 cookie 认证和 CSRF token
+        Args:
+            uri: 请求 URI
+            json_data: JSON 请求体
+
+        Returns:
+
+        """
+        headers = self._build_write_headers(uri)
+        base_url = zhihu_constant.ZHIHU_ZHUANLAN_URL if self._is_zhuanlan_uri(uri) else zhihu_constant.ZHIHU_URL
+        return await self.request(method="POST", url=base_url + uri, headers=headers, json=json_data, **kwargs)
+
+    async def put(self, uri: str, json_data: Optional[Dict] = None, **kwargs) -> Union[str, Any]:
+        """
+        PUT 请求，带 cookie 认证和 CSRF token
+        Args:
+            uri: 请求 URI
+            json_data: JSON 请求体
+
+        Returns:
+
+        """
+        headers = self._build_write_headers(uri)
+        base_url = zhihu_constant.ZHIHU_ZHUANLAN_URL if self._is_zhuanlan_uri(uri) else zhihu_constant.ZHIHU_URL
+        return await self.request(method="PUT", url=base_url + uri, headers=headers, json=json_data, **kwargs)
+
+    async def patch(self, uri: str, json_data: Optional[Dict] = None, **kwargs) -> Union[str, Any]:
+        """
+        PATCH 请求，带 cookie 认证和 CSRF token
+        Args:
+            uri: 请求 URI
+            json_data: JSON 请求体
+
+        Returns:
+
+        """
+        headers = self._build_write_headers(uri)
+        base_url = zhihu_constant.ZHIHU_ZHUANLAN_URL if self._is_zhuanlan_uri(uri) else zhihu_constant.ZHIHU_URL
+        return await self.request(method="PATCH", url=base_url + uri, headers=headers, json=json_data, **kwargs)
+
+    def _get_xsrf_token(self) -> str:
+        """从 Cookie 中提取 CSRF Token（_xsrf）"""
+        return self.cookie_dict.get("_xsrf", "")
 
     async def pong(self) -> bool:
         """
@@ -596,3 +659,157 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         uri = f"/zvideo/{video_id}"
         response_html = await self.get(uri, return_response=True)
         return self._extractor.extract_zvideo_content_from_html(response_html)
+
+    # ------------------------------------------------------------------ #
+    #  发帖相关 API 方法                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def create_article_draft(self, title: str = "", content: str = "") -> Dict:
+        """创建知乎专栏文章草稿，可直接携带标题和内容
+
+        Args:
+            title: 文章标题（可选，后续可通过 update 设置）
+            content: HTML 格式正文（可选）
+
+        Returns:
+            包含 id 的草稿信息字典
+        """
+        uri = "/api/articles/drafts"
+        payload: Dict[str, Any] = {}
+        if title:
+            payload["title"] = title
+        if content:
+            payload["content"] = content
+        return await self.post(uri, json_data=payload)
+
+    async def update_article_draft(
+        self,
+        draft_id: str,
+        title: str,
+        content: str,
+        topics: Optional[List[str]] = None,
+    ) -> Dict:
+        """更新文章草稿内容
+
+        Args:
+            draft_id: 草稿 ID
+            title: 文章标题
+            content: HTML 格式正文
+            topics: 话题列表
+
+        Returns:
+            更新后的草稿信息
+        """
+        uri = f"/api/articles/drafts/{draft_id}"
+        payload: Dict[str, Any] = {
+            "title": title,
+            "content": content,
+        }
+        if topics:
+            payload["topic_url_tokens"] = topics
+        return await self.patch(uri, json_data=payload)
+
+    async def publish_article_draft(self, draft_id: str, column: str = "") -> Dict:
+        """发布已创建的文章草稿
+
+        Args:
+            draft_id: 草稿 ID
+            column: 发布到指定专栏（可选）
+
+        Returns:
+            发布结果
+        """
+        uri = f"/api/articles/{draft_id}/publish"
+        payload: Dict[str, Any] = {"column": None, "commentPermission": "anyone"}
+        if column:
+            payload["column"] = column
+        return await self.put(uri, json_data=payload)
+
+    async def post_answer(self, question_id: str, content: str) -> Dict:
+        """发布回答到指定问题
+
+        Args:
+            question_id: 知乎问题 ID
+            content: HTML 格式回答内容
+
+        Returns:
+            回答数据字典
+        """
+        uri = f"/api/v4/questions/{question_id}/answers"
+        payload = {
+            "content": content,
+            "reshipment_settings": "allowed",
+            "comment_permission": "all",
+            "can_reward": True,
+        }
+        return await self.post(uri, json_data=payload)
+
+    async def upload_image(self, image_path: str) -> str:
+        """通过 Playwright 的 file input 上传图片到知乎。
+
+        直接复用知乎编辑器的文件上传机制，避免 API 认证问题。
+        """
+        import hashlib
+        from pathlib import Path
+
+        path = Path(image_path)
+        if not path.exists():
+            raise FileNotFoundError(f"图片文件不存在：{image_path}")
+
+        with open(image_path, "rb") as fh:
+            file_content = fh.read()
+        image_hash = hashlib.md5(file_content).hexdigest()
+        utils.logger.info(f"[ZhiHuClient.upload_image] hash={image_hash}, size={len(file_content)}")
+
+        page = self.playwright_page
+
+        # 导航到知乎编辑器页面
+        if "zhuanlan.zhihu.com" not in page.url:
+            await page.goto("https://zhuanlan.zhihu.com/write", wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(3)
+
+        # 找到编辑器内图片上传的 file input（accept 包含 image/*）
+        file_inputs = await page.query_selector_all('input[type="file"]')
+        target_input = None
+        for fi in file_inputs:
+            accept = await fi.get_attribute("accept") or ""
+            if "image/webp" in accept or "image/jpg" in accept:
+                target_input = fi
+                break
+        if not target_input:
+            raise DataFetchError("未找到编辑器的图片上传 input")
+
+        # 设置请求拦截器来捕获上传后的 image_id
+        upload_result = {"image_id": "", "object_key": ""}
+
+        async def capture_response(response):
+            url = response.url
+            if "api.zhihu.com/images" in url and response.request.method == "POST":
+                try:
+                    data = await response.json()
+                    uf = data.get("upload_file", {})
+                    upload_result["image_id"] = str(uf.get("image_id", ""))
+                    upload_result["object_key"] = uf.get("object_key", f"v2-{image_hash}")
+                except Exception:
+                    pass
+
+        page.on("response", capture_response)
+
+        try:
+            # 通过 file input 触发上传
+            await target_input.set_input_files(str(path.resolve()))
+            utils.logger.info("[ZhiHuClient.upload_image] 已触发文件上传，等待完成...")
+
+            # 等待上传完成（最多 30 秒）
+            for _ in range(30):
+                await asyncio.sleep(1)
+                if upload_result["image_id"]:
+                    break
+
+        finally:
+            page.remove_listener("response", capture_response)
+
+        object_key = upload_result["object_key"] or f"v2-{image_hash}"
+        image_url = f"https://pic1.zhimg.com/{object_key}_r.jpg"
+        utils.logger.info(f"[ZhiHuClient.upload_image] 上传成功: {image_url}")
+        return image_url

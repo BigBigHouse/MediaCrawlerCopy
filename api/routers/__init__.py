@@ -21,5 +21,6 @@ from .data import router as data_router
 from .websocket import router as websocket_router
 from .xhs import router as xhs_router
 from .weibo import router as weibo_router
+from .zhihu import router as zhihu_router
 
-__all__ = ["crawler_router", "data_router", "websocket_router", "xhs_router", "weibo_router"]
+__all__ = ["crawler_router", "data_router", "websocket_router", "xhs_router", "weibo_router", "zhihu_router"]
